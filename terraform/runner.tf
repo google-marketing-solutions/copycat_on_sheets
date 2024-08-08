@@ -12,6 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+
+resource "null_resource" "always_run" {
+  triggers = {
+    timestamp = "${timestamp()}"
+  }
+}
+
+
 resource "time_sleep" "wait_60s" {
   create_duration = "60s"
 
@@ -22,11 +30,43 @@ resource "time_sleep" "wait_60s" {
   ]
 }
 
-resource "null_resource" "add_copycat_lib" {
+
+resource "null_resource" "clean_copycat_lib" {
   provisioner "local-exec" {
-    command = "cp -R ${path.root}/../lib/ ${path.root}/../cloud_functions/runner"
+    command = "${var.COPYCAT_CLEAN_REPOSITORY_DIR_COMMAND} ./copycat"
     interpreter = ["bash", "-c"]
   }
+  lifecycle {
+    replace_triggered_by = [
+      null_resource.always_run
+    ]
+  }
+}
+
+resource "null_resource" "clone_copycat_repo" {
+  provisioner "local-exec" {
+    command = "${var.COPYCAT_CLONE_REPOSITORY_COMMAND}"
+    interpreter = ["bash", "-c"]
+  }
+  lifecycle {
+    replace_triggered_by = [
+      null_resource.always_run
+    ]
+  }
+  depends_on = [ null_resource.clean_copycat_lib ]
+}
+
+resource "null_resource" "add_copycat_lib" {
+  provisioner "local-exec" {
+    command = "rsync -r ./copycat ${path.root}/../cloud_functions/runner/lib --exclude .git --exclude google_ads_scripts --exclude internal"
+    interpreter = ["bash", "-c"]
+  }
+  lifecycle {
+    replace_triggered_by = [
+      null_resource.always_run
+    ]
+  }
+  depends_on = [ null_resource.clone_copycat_repo ]
 }
 
 resource "google_cloud_run_v2_service_iam_binding" "runner_cf_cr_binding" {
@@ -40,7 +80,6 @@ resource "google_cloud_run_v2_service_iam_binding" "runner_cf_cr_binding" {
     ]
 }
 
-
 resource "google_cloud_run_v2_service_iam_binding" "runner_cf_srva_binding" {
   location = google_cloudfunctions2_function.runner.location
   project  = google_cloudfunctions2_function.runner.project
@@ -50,21 +89,26 @@ resource "google_cloud_run_v2_service_iam_binding" "runner_cf_srva_binding" {
   members = [
     "serviceAccount:${google_service_account.sa.email}",
   ]
-
 }
 
 data "archive_file" "runner_archive" {
   type        = "zip"
   output_path = ".temp/runner_code_source.zip"
   source_dir  = "${path.module}/../cloud_functions/runner/"
-  depends_on = [ google_storage_bucket.copycat_build_bucket ]
+
+  depends_on = [ google_storage_bucket.copycat_build_bucket, null_resource.add_copycat_lib ]
 }
 
 resource "google_storage_bucket_object" "runner_object" {
   name       = "${var.DEPLOYMENT_NAME}-runner-${data.archive_file.runner_archive.output_sha256}.zip"
   bucket     = google_storage_bucket.copycat_build_bucket.name
   source     = data.archive_file.runner_archive.output_path
-  depends_on = [data.archive_file.runner_archive]
+  depends_on = [data.archive_file.runner_archive, null_resource.add_copycat_lib]
+  lifecycle {
+    replace_triggered_by = [
+      null_resource.add_copycat_lib
+    ]
+  }
 }
 
 resource "google_cloudfunctions2_function" "runner" {
@@ -72,7 +116,7 @@ resource "google_cloudfunctions2_function" "runner" {
   description = "It runs a copycat execution receiving and input google sheet URL and the name of the sheet with the configuration"
   project     = var.PROJECT_ID
   location    = var.REGION
-  depends_on = [ google_storage_bucket.copycat_build_bucket, null_resource.add_copycat_lib, google_storage_bucket_object.runner_object, time_sleep.wait_60s]
+  depends_on = [ null_resource.clone_copycat_repo, google_storage_bucket.copycat_build_bucket, null_resource.add_copycat_lib, google_storage_bucket_object.runner_object, time_sleep.wait_60s]
 
   build_config {
     runtime     = "python310"
