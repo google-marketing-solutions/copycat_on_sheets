@@ -51,6 +51,7 @@ DEFAULT_CONFIG = {
     "TOP_K": 50,
     "TOP_P": 1,
     "BATCH_SIZE": 10,
+    "DATA_LIMIT": 0,
 }
 
 FAILED_STATUS_FOR_REPORTING = "ERROR_IN_COPYCAT_RUNNER"
@@ -112,7 +113,11 @@ def run(request: flask.Request) -> flask.Response:
     (training_data, test_data) = _prepare_training_data(
         ad_report_data, keywords_data, new_keywords_data
     )
-    training_data = training_data[:10]
+    training_data = (
+        training_data[: int(config["DATA_LIMIT"])]
+        if int(config["DATA_LIMIT"]) > 0
+        else training_data
+    )
     model = copycat.Copycat.create_from_pandas(
         training_data=training_data,
         embedding_model_name=config["EMBEDDING_MODEL_NAME"],
@@ -161,7 +166,11 @@ def run(request: flask.Request) -> flask.Response:
         "worksheet_url": worksheet_url if worksheet_url else None,
         "config_sheet_name": config_sheet_name if config_sheet_name else None,
         "status": FAILED_STATUS_FOR_REPORTING,
-        "message": str(e),
+        "message": (
+            str(e)
+            if len(str(e) > 1)
+            else "Check you shared the spreadsheet with the service account"
+        ),
         "success": False,
     }
 
@@ -285,7 +294,7 @@ def _load_data(
       {ord(i): None for i in '+[]"'}
   )
 
-  keywords_data = keywords_data.drop_duplicates()
+  keywords_data = keywords_data.dropna().drop_duplicates()
 
   keywords_data = keywords_data.groupby(["Campaign ID", "Ad Group ID"]).agg(
       keywords=("Keyword", lambda x: ", ".join(x).lower())
