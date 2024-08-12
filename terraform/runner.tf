@@ -85,7 +85,6 @@ resource "google_cloud_run_v2_service_iam_binding" "runner_cf_srva_binding" {
   project  = google_cloudfunctions2_function.runner.project
   name     = google_cloudfunctions2_function.runner.name
   role     = "roles/cloudfunctions.serviceAgent"
-  #members        = ["allUsers"]
   members = [
     "serviceAccount:${google_service_account.sa.email}",
   ]
@@ -156,3 +155,17 @@ resource "google_cloudfunctions2_function" "runner" {
   }
 }
 
+output PROJECT_NUMBER {
+  value =  var.PROJECT_NUMBER
+  depends_on = [ google_cloudfunctions2_function.runner ]
+}
+
+output COPYCAT_SERVICE_ACCOUNT {
+  value = google_service_account.sa.email
+  depends_on = [ google_cloudfunctions2_function.runner ]
+}
+
+output COPYCAT_ENDPOINT_URL {
+  value = google_cloudfunctions2_function.runner.url
+  depends_on = [ google_cloudfunctions2_function.runner ]
+}

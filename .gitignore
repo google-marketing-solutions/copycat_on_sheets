@@ -4,5 +4,6 @@
 /terraform/.terraform*
 /terraform/terraform.tfstate*
 /terraform/copycat*
+/terraform/terraform.tfvars.local
 /lib*
 .temp
