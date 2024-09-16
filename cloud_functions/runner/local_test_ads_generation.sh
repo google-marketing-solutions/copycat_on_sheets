@@ -17,12 +17,14 @@
 #
 
 CONFIG_PATH="../../terraform/terraform.tfvars"
+WORKSHEET_URL="https://docs.google.com/spreadsheets/d/XXXXXXXXXXXXXXXXXX"
 
 set -a
 eval "$(cat ${CONFIG_PATH} | sed -e 's/ *= */=/g')"
 
-curl localhost:8080   -X POST   -H "Content-Type: application/json"   -H "ce-id: 123451234512345"   -H "ce-specversion: 1.0"   -H "ce-time: 2020-01-02T12:34:56.789Z"  -H "x-cloudtasks-taskretrycount: 0"   -d '{"worksheet_url": "https://docs.google.com/spreadsheets/d/1Bpcj4rC3Ytc5mQVuuvP7L1cD4J1xa9GwEnYnUwJyKgA",
-    "config_sheet_name": "config"
+curl localhost:8080   -X POST   -H "Content-Type: application/json"   -H "ce-id: 123451234512345"   -H "ce-specversion: 1.0"   -H "ce-time: 2020-01-02T12:34:56.789Z"  -H "x-cloudtasks-taskretrycount: 0"   -d '{"worksheet_url": '\"${WORKSHEET_URL}\"',
+    "config_sheet_name": "config",
+    "operation": "ADS_GENERATION"
 }'
 
 

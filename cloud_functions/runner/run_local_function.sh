@@ -20,6 +20,6 @@ export PROJECT_ID="<SET_PROJECT_HERE>"
 export REGION="us-central1"
 export SERVICE_ACCOUNT="<SET_SA_HERE>"
 
-cp -R ../../lib ./
+#cp -R ../../lib ./
 
 functions-framework --target=run

@@ -19,7 +19,7 @@
 import json
 import os
 import sys
-from typing import Any, Dict, Union
+from typing import Any, Union
 import flask
 import functions_framework
 import google.auth
@@ -28,21 +28,25 @@ import gspread
 import numpy as np
 import pandas as pd
 
-sys.path.insert(0, "./lib")
-from copycat.py import copycat
+sys.path.insert(0, "./lib/copycat/py")
+from copycat import copycat
 
 sheet_client = None
 
 DEFAULT_CONFIG = {
     "COMPANY_NAME": "My Company",
+    "COPYCAT_ENDPOINT_URL": "",
+    "COPYCAT_SERVICE_ACCOUNT": "",
     "AD_REPORT_URL": "",
     "AD_REPORT_SHEET_NAME": "Ad Report",
     "SEARCH_KEYWORD_REPORT_URL": "",
     "SEARCH_KEYWORD_REPORT_SHEET_NAME": "",
     "NEW_KEYWORDS_URL": "",
     "NEW_KEYWORDS_SHEET_NAME": "",
+    "RESULTS_URL": "",
+    "RESULTS_SHEET_NAME": "",
     "USE_STYLE_GUIDE": "",
-    "EMBEDDING_MODEL_NAME": "text-embedding-ada-002",
+    "EMBEDDING_MODEL_NAME": "text-embedding-004",
     "AD_FORMAT": "RSA",
     "LANGUAGE": "English",
     "NUM_IN_CONTEXT_EXAMPLES": 100,
@@ -52,10 +56,152 @@ DEFAULT_CONFIG = {
     "TOP_P": 1,
     "BATCH_SIZE": 10,
     "DATA_LIMIT": 0,
+    "STYLE_GUIDE": "",
 }
 
 FAILED_STATUS_FOR_REPORTING = "ERROR_IN_COPYCAT_RUNNER"
 CF_NAME = "copycat_runner"
+
+OPERATIONS = {
+    "STYLE_GUIDE_GENERATION": "_style_guide_generation",
+    "ADS_GENERATION": "_ads_generation",
+}
+
+
+def _load_all_data(
+    config: dict[str, str], sheets_client: gspread.Client
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+  """Loads and prepares all data for training and generation.
+
+  Args:
+    config: A dictionary containing the configuration parameters.
+    sheets_client: gspread client object.
+
+  Returns:
+    A tuple containing two pandas DataFrames:
+      - training_data: Prepared data for training the Copycat model.
+      - test_data: Prepared data for generating new ad copy.
+  """
+
+  (
+      ad_report_data,
+      keywords_data,
+      new_keywords_data,
+  ) = _load_data(sheets_client, config)
+
+  (training_data, test_data) = _prepare_training_data(
+      ad_report_data, keywords_data, new_keywords_data
+  )
+  training_data = (
+      training_data[: int(config["DATA_LIMIT"])]
+      if int(config["DATA_LIMIT"]) > 0
+      else training_data
+  )
+
+  return (training_data, test_data)
+
+
+def _style_guide_generation(
+    config: dict[str, str],
+    sheets_client: gspread.Client,
+    worksheet_url: str,
+    config_sheet_name: str,
+) -> tuple[dict[str, str], pd.DataFrame, pd.DataFrame]:
+  """Generates a style guide, loads data and prepares it for training and generation.
+
+  Args:
+    config: A dictionary containing the configuration parameters.
+    sheets_client: gspread client object.
+    worksheet_url:  The URL of the Google Sheet containing the configuration.
+    config_sheet_name: The name of the sheet in the Google Sheet containing the
+      configuration.
+
+  Returns:
+    A tuple containing style guide, training_data and test_data:
+        - style guide: A string containing the generated style guide.
+        - training_data: Prepared data for training the Copycat model.
+        - test_data: Prepared data for generating new ad copy.
+  """
+  (training_data, test_data) = _load_all_data(config, sheets_client)
+  config["STYLE_GUIDE"] = _generate_style_guide(config, training_data)
+
+  _write_config_into_google_sheet(
+      config, sheets_client, worksheet_url, config_sheet_name
+  )
+
+  return (config, training_data, test_data)
+
+
+def _ads_generation(
+    config: dict[str, str],
+    sheets_client: gspread.Client,
+    worksheet_url: str,
+    config_sheet_name: str,
+):
+  """Generates new ad copy using the Copycat model and writes it to a Google Sheet.
+
+  Args:
+    config: A dictionary containing the configuration parameters.
+    sheets_client: gspread client object.
+    worksheet_url:  The URL of the Google Sheet containing the configuration.
+    config_sheet_name: The name of the sheet in the Google Sheet containing the
+      configuration.
+  """
+  style_guide = config["STYLE_GUIDE"] if "STYLE_GUIDE" in config else ""
+  training_data = None
+  test_data = None
+
+  if not (style_guide and len(style_guide) > 1):
+    (config, training_data, test_data) = _style_guide_generation(
+        config,
+        sheets_client,
+        worksheet_url,
+        config_sheet_name,
+    )
+    style_guide = config["STYLE_GUIDE"]
+  else:
+    (training_data, test_data) = _load_all_data(config, sheets_client)
+
+  # If new parameters are added to the copycat library, this create operations
+  # will need to be updated with those new parameters, as well as the config
+  # sheet of the spreadsheet.
+  model = copycat.Copycat.create_from_pandas(
+      training_data=training_data,
+      embedding_model_name=config["EMBEDDING_MODEL_NAME"],
+      ad_format=config["AD_FORMAT"],
+  )
+
+  generated_ads = []
+
+  n_batches = np.ceil(len(test_data["keywords"]) / int(config["BATCH_SIZE"]))
+
+  for data_batch in np.array_split(test_data, n_batches, axis=0):
+    generated_ads.extend(
+        model.generate_new_ad_copy(
+            keywords=data_batch["keywords"].values.tolist(),
+            keywords_specific_instructions=data_batch[
+                "information"
+            ].values.tolist(),
+            system_instruction_kwargs=dict(
+                company_name=config["COMPANY_NAME"],
+                language=config["LANGUAGE"],
+            ),
+            style_guide=style_guide,
+            num_in_context_examples=int(config["NUM_IN_CONTEXT_EXAMPLES"]),
+            model_name=config["CHAT_MODEL_NAME"],
+            temperature=float(config["TEMPERATURE"]),
+            top_k=float(config["TOP_K"]),
+            top_p=float(config["TOP_P"]),
+        )
+    )
+
+    test_data["generated_ad_object"] = pd.Series(
+        generated_ads, index=data_batch["keywords"].index
+    )
+
+  results = _extract_resulting_ads(test_data)
+
+  _write_results_into_google_sheet(config, sheets_client, results)
 
 
 @functions_framework.http
@@ -97,6 +243,12 @@ def run(request: flask.Request) -> flask.Response:
 
   try:
 
+    operation = request_json["operation"]
+    print(f"Operation: {operation}.")
+    function_name = (
+        OPERATIONS[operation] if operation in OPERATIONS else OPERATIONS[0]
+    )
+    print(f"Function name: {function_name}.")
     worksheet_url = request_json["worksheet_url"]
     config_sheet_name = request_json["config_sheet_name"]
     sheets_client = _init_google_sheet_client()
@@ -104,60 +256,8 @@ def run(request: flask.Request) -> flask.Response:
         DEFAULT_CONFIG, sheets_client, worksheet_url, config_sheet_name
     )
 
-    (
-        ad_report_data,
-        keywords_data,
-        new_keywords_data,
-    ) = _load_data(sheets_client, config)
-
-    (training_data, test_data) = _prepare_training_data(
-        ad_report_data, keywords_data, new_keywords_data
-    )
-    training_data = (
-        training_data[: int(config["DATA_LIMIT"])]
-        if int(config["DATA_LIMIT"]) > 0
-        else training_data
-    )
-    model = copycat.Copycat.create_from_pandas(
-        training_data=training_data,
-        embedding_model_name=config["EMBEDDING_MODEL_NAME"],
-        persist_path="/tmp",
-        ad_format=config["AD_FORMAT"],
-    )
-
-    style_guide = _generate_style_guide(config, training_data)
-
-    generated_ads = []
-
-    n_batches = np.ceil(len(test_data["keywords"]) / int(config["BATCH_SIZE"]))
-
-    for data_batch in np.array_split(test_data, n_batches, axis=0):
-      generated_ads.extend(
-          model.generate_new_ad_copy(
-              keywords=data_batch["keywords"].values.tolist(),
-              keywords_specific_instructions=data_batch[
-                  "information"
-              ].values.tolist(),
-              system_instruction_kwargs=dict(
-                  company_name=config["COMPANY_NAME"],
-                  language=config["LANGUAGE"],
-              ),
-              style_guide=style_guide,
-              num_in_context_examples=int(config["NUM_IN_CONTEXT_EXAMPLES"]),
-              model_name=config["CHAT_MODEL_NAME"],
-              temperature=float(config["TEMPERATURE"]),
-              top_k=float(config["TOP_K"]),
-              top_p=float(config["TOP_P"]),
-          )
-      )
-
-      test_data["generated_ad_object"] = pd.Series(
-          generated_ads, index=data_batch["keywords"].index
-      )
-
-    results = _extract_resulting_ads(test_data)
-
-    _write_result_into_google_sheet(config, sheets_client, results)
+    call_function = globals()[function_name]
+    call_function(config, sheets_client, worksheet_url, config_sheet_name)
 
     return ("Results generated", 200)
   except Exception as e:
@@ -248,7 +348,7 @@ def _extract_resulting_ads(data: pd.Series) -> pd.Series:
 
 
 def _load_data(
-    sheets_client: gspread.client, config: Dict[str, Any]
+    sheets_client: gspread.Client, config: dict[str, Any]
 ) -> Union[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
   """Loads data from Google Sheets and prepares it for training.
 
@@ -348,7 +448,7 @@ def _prepare_training_data(
 
 
 def _generate_style_guide(
-    config: Dict[str, Any], training_data: pd.DataFrame
+    config: dict[str, Any], training_data: pd.DataFrame
 ) -> str:
   """Generates a style guide for ad copy based on existing ad data.
 
@@ -429,11 +529,11 @@ def _init_google_sheet_client():
 
 
 def _read_config_from_google_sheet(
-    default_config: Dict[str, str],
-    sheets_client: gspread.client,
+    default_config: dict[str, str],
+    sheets_client: gspread.Client,
     worksheet_url: str,
     config_sheet_name: str,
-) -> Dict[str, str]:
+) -> dict[str, str]:
   """Reads the configuration parameters from a Google Sheet.
 
   Args:
@@ -551,8 +651,8 @@ def _clean_ad_report_data(ad_report_data: pd.DataFrame) -> pd.DataFrame:
   return clean_ad_report_data
 
 
-def _write_result_into_google_sheet(
-    config: Dict[str, str], sheets_client: gspread.client, results: pd.Series
+def _write_results_into_google_sheet(
+    config: dict[str, str], sheets_client: gspread.Client, results: pd.Series
 ):
   """Writes the generated ad copy results to a Google Sheet.
 
@@ -581,3 +681,27 @@ def _write_result_into_google_sheet(
   sheet.worksheet(results_sheet_name).update(
       f"A1:{column_letters[len(values[0])-1]}{len(values)+1}", values
   )
+
+
+def _write_config_into_google_sheet(
+    config: dict[str, str],
+    sheets_client: gspread.Client,
+    worksheet_url: str,
+    config_sheet_name: str,
+):
+  """Writes the configuration parameters to a Google Sheet.
+
+  Args:
+    config: A dictionary containing the configuration parameters.
+    sheets_client: gspread client object.
+    worksheet_url: The URL of the Google Sheet containing the configuration.
+    config_sheet_name: The name of the sheet in the Google Sheet containing the
+      configuration.
+  """
+  sheet = sheets_client.open_by_url(worksheet_url)
+  config_sheet = sheet.worksheet(config_sheet_name)
+
+  cell = config_sheet.find("STYLE_GUIDE")
+  if cell:
+    config_sheet.update_cell(cell.row, cell.col + 1, config["STYLE_GUIDE"])
+
