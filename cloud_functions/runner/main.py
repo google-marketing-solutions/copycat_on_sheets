@@ -268,7 +268,7 @@ def run(request: flask.Request) -> flask.Response:
         "status": FAILED_STATUS_FOR_REPORTING,
         "message": (
             str(e)
-            if len(str(e) > 1)
+            if len(str(e)) > 1
             else "Check you shared the spreadsheet with the service account"
         ),
         "success": False,
