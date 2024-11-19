@@ -6,9 +6,11 @@ Automatically create ad copies at scale based on brand style by Generative AI
 
 ## Solution
 
-Copycat uses Gemini 1.5 and the Google Ads API to build a comprehensive style
-guide of the customers previous ad copies. It can then automatically create new
-ad copies with Gemini based on new keyword/campaigns.
+Copycat on sheets leverages the [Copycat library](https://github.com/google-marketing-solutions/copycat/blob/main/README.md) power withing Google Sheets.
+
+Copycat is a Python package that leverages Google Gemini models to generate high-quality ad copies for Google Search campaigns. Whether you need Responsive Search Ads or Text Ads, Copycat learns from your top-performing ads and brand guidelines to create copy that seamlessly aligns with your brand voice.
+
+To do so, Copycat on Sheets, deploys a Cloud Run Function in your Google Cloud a project that provides the processing endpoint to be called by the authorized users from the ad-hoc Copycat menu created on the Google Sheet.
 
 ## Installation Steps
 
@@ -42,10 +44,3 @@ ad copies with Gemini based on new keyword/campaigns.
 10. On the menu bar on the top, click on `Extension` > `Apps Script`
 11. On the new window, on the left pane menu, click on `Project Settings` and on the section "Google Cloud Platform (GCP) Project", click on `Change Project` and add the value of `PROJECT_NUMBER` from Step 6.
 12. You are all set!! Follow the instructions on the `instruction` tab of the sheet.
-
-## Important Note
-
-By default, `copycat_on_sheets` will use the copycat code in the head of the copycat's git repository: `https://github.com/google-marketing-solutions/copycat.git`
-
-In case you would need to point to a specific version of copycat, you could add the clone command in the following `terraform.tfvars` variable:
-    * `COPYCAT_CLONE_REPOSITORY_COMMAND = "git clone https://github.com/google-marketing-solutions/copycat.git"`
