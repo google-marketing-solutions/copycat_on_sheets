@@ -17,19 +17,25 @@
 # -*- coding: utf-8 -*-
 
 import json
+import logging
 import os
 import sys
-from typing import Any, Union
+import traceback
+from typing import Any
 import flask
 import functions_framework
 import google.auth
 from google.cloud import logging
 import gspread
-import numpy as np
+import nest_asyncio
 import pandas as pd
 
-sys.path.insert(0, "./lib/copycat/py")
+nest_asyncio.apply()
+
 from copycat import copycat
+from copycat.data import sheets
+from copycat.data import utils as data_utils
+from copycat import google_ads
 
 sheet_client = None
 
@@ -37,25 +43,29 @@ DEFAULT_CONFIG = {
     "COMPANY_NAME": "My Company",
     "COPYCAT_ENDPOINT_URL": "",
     "COPYCAT_SERVICE_ACCOUNT": "",
-    "AD_REPORT_URL": "",
-    "AD_REPORT_SHEET_NAME": "Ad Report",
-    "SEARCH_KEYWORD_REPORT_URL": "",
-    "SEARCH_KEYWORD_REPORT_SHEET_NAME": "",
-    "NEW_KEYWORDS_URL": "",
-    "NEW_KEYWORDS_SHEET_NAME": "",
-    "RESULTS_URL": "",
-    "RESULTS_SHEET_NAME": "",
-    "USE_STYLE_GUIDE": "",
+    "TRAINING_ADS_SHEET_NAME": "Training Ads",
     "EMBEDDING_MODEL_NAME": "text-embedding-004",
-    "AD_FORMAT": "RSA",
+    "AD_FORMAT": "responsive_search_ad",
     "LANGUAGE": "English",
-    "NUM_IN_CONTEXT_EXAMPLES": 100,
-    "CHAT_MODEL_NAME": "gemini-1.5-pro-preview-0514",
+    "CHAT_MODEL_NAME": "gemini-1.5-pro",
+    "MODEL_DIMENSIONALITY": 768,
     "TEMPERATURE": 0.7,
     "TOP_K": 50,
     "TOP_P": 1,
     "BATCH_SIZE": 10,
     "DATA_LIMIT": 0,
+    "GENERATION_LIMIT": 30,
+    "USE_CUSTOM_AFFINITY_PREFERENCE": "TRUE",
+    "CUSTOM_AFFINITY_PREFERENCE": -0.5,
+    "EXEMPLAR_SELECTION_METHOD": "affinity_propagation",
+    "MAX_INITIAL_ADS": 2000,
+    "MAX_EXEMPLAR_ADS": 200,
+    "REPLACE_SPECIAL_VARIABLES_WITH_DEFAULT": "replace",
+    "ON_INVALID_AD": "drop",
+    "USE_STYLE_GUIDE": "FALSE",
+    "STYLE_GUIDE_ADDITIONAL_INSTRUCTIONS": "",
+    "STYLE_GUIDE_USE_EXEMPLAR_ADS": "TRUE",
+    "STYLE_GUIDE_FILES_URL": "",
     "STYLE_GUIDE": "",
 }
 
@@ -68,140 +78,418 @@ OPERATIONS = {
 }
 
 
-def _load_all_data(
-    config: dict[str, str], sheets_client: gspread.Client
-) -> tuple[pd.DataFrame, pd.DataFrame]:
-  """Loads and prepares all data for training and generation.
+def _init_log():
+  """Initializes the logger."""
+  client = google.cloud.logging.Client()
+  client.setup_logging()
+  return logging.getLogger("copycat.on_sheets")
+
+
+def _send_log(message: str, level: int = logging.INFO) -> None:
+  """Sends a log message to the logger.
 
   Args:
-    config: A dictionary containing the configuration parameters.
-    sheets_client: gspread client object.
-
-  Returns:
-    A tuple containing two pandas DataFrames:
-      - training_data: Prepared data for training the Copycat model.
-      - test_data: Prepared data for generating new ad copy.
+    message: The log message to send.
+    level: The level of the log message. Defaults to INFO.
   """
 
-  (
-      ad_report_data,
-      keywords_data,
-      new_keywords_data,
-  ) = _load_data(sheets_client, config)
+  logger.log(level=level, msg=message)
 
-  (training_data, test_data) = _prepare_training_data(
-      ad_report_data, keywords_data, new_keywords_data
-  )
-  training_data = (
-      training_data[: int(config["DATA_LIMIT"])]
-      if int(config["DATA_LIMIT"]) > 0
-      else training_data
+
+logger = _init_log()
+
+
+def _prepare_training_data(
+    config: pd.DataFrame, sheet: sheets.GoogleSheet
+) -> pd.DataFrame:
+  """Prepares training data for the Copycat model.
+
+  Loads the training ads data from the specified sheet, collapses the headlines
+  and descriptions
+  into lists, renames the 'Keywords' column to 'keywords', selects the relevant
+  columns,
+  and filters out rows with empty 'headlines'.
+
+  Args:
+    config: A Pandas DataFrame containing configuration parameters, including
+      the sheet name for training ads.
+    sheet: A GoogleSheet object representing the spreadsheet containing the
+      data.
+
+  Returns:
+    A Pandas DataFrame containing the prepared training data with 'keywords',
+    'headlines',
+    and 'descriptions' columns.
+  """
+
+  training_ads_data = sheet[config["TRAINING_ADS_SHEET_NAME"]]
+
+  prepared_training_ads = data_utils.collapse_headlines_and_descriptions(
+      training_ads_data
+  ).rename(columns={"Keywords": "keywords"})[
+      ["keywords", "headlines", "descriptions"]
+  ]
+
+  prepared_training_ads = prepared_training_ads.loc[
+      prepared_training_ads["headlines"].apply(len) > 0
+  ]
+
+  return prepared_training_ads
+
+
+def _prepare_new_ads_for_generation(
+    sheet: sheets.GoogleSheet,
+    n_versions: int,
+    fill_gaps: bool,
+    copycat_instance: copycat.Copycat,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+  """Prepares new ads for generation.
+
+  This function prepares new ads for generation by loading the data from the
+  Google Sheet, constructing the complete data, and filtering out any ads that
+  have already been generated.
+
+  Args:
+    sheet: The Google Sheet to load the data from.
+    n_versions: The number of versions to generate for each ad.
+    fill_gaps: Whether to fill gaps in the existing generations.
+    copycat_instance: The Copycat instance to use for generation.
+
+  Returns:
+    A tuple containing the new generations data and the complete data.
+  """
+  new_keywords_data = sheet["New Keywords"]
+  additional_instructions_data = sheet["Extra Instructions for New Ads"]
+
+  additional_instructions_data.index = (
+      additional_instructions_data.index.set_levels(
+          additional_instructions_data.index.get_level_values("Version").astype(
+              str
+          ),
+          level="Version",
+          verify_integrity=False,
+      )
   )
 
-  return (training_data, test_data)
+  if "Generated Ads" in sheet:
+    existing_generations_data = sheet["Generated Ads"]
+    if "Headline 1" not in existing_generations_data.columns:
+      existing_generations_data = None
+  else:
+    existing_generations_data = None
+
+  if existing_generations_data is None:
+
+    complete_data = data_utils.construct_generation_data(
+        new_keywords_data=new_keywords_data,
+        additional_instructions_data=additional_instructions_data,
+        n_versions=n_versions,
+        keyword_column="Keyword",
+        version_column="Version",
+        additional_instructions_column="Extra Instructions",
+    )
+    complete_data["existing_headlines"] = [[]] * len(complete_data)
+    complete_data["existing_descriptions"] = [[]] * len(complete_data)
+    new_generations_data = complete_data.copy()
+    return new_generations_data, complete_data
+
+  existing_generations_data = data_utils.collapse_headlines_and_descriptions(
+      existing_generations_data
+  ).rename(
+      columns={
+          "headlines": "existing_headlines",
+          "descriptions": "existing_descriptions",
+      }
+  )
+
+  existing_generations_data.index = existing_generations_data.index.set_levels(
+      existing_generations_data.index.get_level_values("Version").astype(str),
+      level="Version",
+      verify_integrity=False,
+  )
+
+  complete_data = data_utils.construct_generation_data(
+      new_keywords_data=new_keywords_data,
+      additional_instructions_data=additional_instructions_data,
+      existing_generations_data=existing_generations_data,
+      n_versions=n_versions,
+      existing_headlines_column="existing_headlines",
+      existing_descriptions_column="existing_descriptions",
+      keyword_column="Keyword",
+      version_column="Version",
+      additional_instructions_column="Extra Instructions",
+  )
+
+  missing_columns = [
+      column
+      for column in existing_generations_data.columns
+      if column not in complete_data.columns
+  ]
+
+  if missing_columns:
+    complete_data = complete_data.join(
+        existing_generations_data[missing_columns],
+        how="left",
+    )
+
+  generation_not_required = complete_data.index.isin(
+      existing_generations_data.index
+  )
+
+  if fill_gaps:
+    generation_not_required = generation_not_required & complete_data.apply(
+        lambda row: copycat_instance.ad_copy_evaluator.is_complete(
+            copycat.GoogleAd(
+                headlines=row["existing_headlines"],
+                descriptions=row["existing_descriptions"],
+            )
+        ),
+        axis=1,
+    )
+  else:
+    generation_not_required = generation_not_required & complete_data.apply(
+        lambda row: not copycat_instance.ad_copy_evaluator.is_empty(
+            copycat.GoogleAd(
+                headlines=row["existing_headlines"],
+                descriptions=row["existing_descriptions"],
+            )
+        ),
+        axis=1,
+    )
+
+  new_generations_data = complete_data.loc[~generation_not_required].copy()
+
+  return new_generations_data, complete_data
 
 
 def _style_guide_generation(
     config: dict[str, str],
-    sheets_client: gspread.Client,
-    worksheet_url: str,
     config_sheet_name: str,
-) -> tuple[dict[str, str], pd.DataFrame, pd.DataFrame]:
-  """Generates a style guide, loads data and prepares it for training and generation.
+    sheet: sheets.GoogleSheet,
+    copycat_instance: copycat.Copycat,
+) -> str:
+  """Generates a style guide and writes it to the config sheet.
+
+  This function generates a style guide using the provided Copycat instance and
+  configuration parameters. The generated style guide is then stored in the
+  config dictionary and written to the specified Google Sheet.
 
   Args:
-    config: A dictionary containing the configuration parameters.
-    sheets_client: gspread client object.
-    worksheet_url:  The URL of the Google Sheet containing the configuration.
+    config: A dictionary containing configuration parameters.
     config_sheet_name: The name of the sheet in the Google Sheet containing the
       configuration.
+    sheet: A GoogleSheet object representing the spreadsheet.
+    copycat_instance: A Copycat object used for generating the style guide.
 
   Returns:
-    A tuple containing style guide, training_data and test_data:
-        - style guide: A string containing the generated style guide.
-        - training_data: Prepared data for training the Copycat model.
-        - test_data: Prepared data for generating new ad copy.
+    The generated style guide string.
   """
-  (training_data, test_data) = _load_all_data(config, sheets_client)
-  config["STYLE_GUIDE"] = _generate_style_guide(config, training_data)
 
-  _write_config_into_google_sheet(
-      config, sheets_client, worksheet_url, config_sheet_name
+  config["STYLE_GUIDE"] = _generate_style_guide(config, copycat_instance)
+  _write_config_into_google_sheet(config, sheet, config_sheet_name)
+
+  return config["STYLE_GUIDE"]
+
+
+def _instantiate_copycat_model(config: pd.DataFrame, sheet: sheets.GoogleSheet):
+  """Instantiates a Copycat model.
+
+  Prepares the training data, determines the ad format, and creates a Copycat
+  instance using the provided configuration and data from the Google Sheet.
+
+  Args:
+    config: A Pandas DataFrame containing the configuration parameters.
+    sheet: A GoogleSheet object representing the spreadsheet containing the
+      data.
+
+  Returns:
+    A Copycat instance.
+  """
+
+  training_ads_data = _prepare_training_data(config, sheet)
+
+  max_headlines = google_ads.get_google_ad_format(
+      "responsive_search_ad"
+  ).max_headlines
+  max_descriptions = google_ads.get_google_ad_format(
+      "responsive_search_ad"
+  ).max_descriptions
+
+  if config["AD_FORMAT"] == "custom":
+    ad_format = copycat.google_ads.GoogleAdFormat(
+        name="custom",
+        max_headlines=max_headlines,
+        max_descriptions=max_descriptions,
+        min_headlines=1,
+        min_descriptions=1,
+        max_headline_length=30,
+        max_description_length=90,
+    )
+  else:
+    ad_format = copycat.google_ads.get_google_ad_format(config["AD_FORMAT"])
+
+  affinity_preference = (
+      config["CUSTOM_AFFINITY_PREFERENCE"]
+      if config["CUSTOM_AFFINITY_PREFERENCE"]
+      else None
   )
 
-  return (config, training_data, test_data)
+  copycat_instance = copycat.Copycat.create_from_pandas(
+      training_data=training_ads_data,
+      ad_format=ad_format,
+      on_invalid_ad=config["ON_INVALID_AD"],
+      embedding_model_name=config["EMBEDDING_MODEL_NAME"],
+      embedding_model_dimensionality=float(config["MODEL_DIMENSIONALITY"]),
+      embedding_model_batch_size=int(config["BATCH_SIZE"]),
+      vectorstore_exemplar_selection_method=config["EXEMPLAR_SELECTION_METHOD"],
+      vectorstore_max_initial_ads=int(config["MAX_INITIAL_ADS"]),
+      vectorstore_max_exemplar_ads=int(config["MAX_EXEMPLAR_ADS"]),
+      vectorstore_affinity_preference=affinity_preference,
+      replace_special_variables_with_default=config[
+          "REPLACE_SPECIAL_VARIABLES_WITH_DEFAULT"
+      ]
+      == "replace",
+  )
+
+  return copycat_instance
 
 
 def _ads_generation(
     config: dict[str, str],
-    sheets_client: gspread.Client,
-    worksheet_url: str,
     config_sheet_name: str,
+    sheet: sheets.GoogleSheet,
+    copycat_instance: copycat.Copycat,
 ):
-  """Generates new ad copy using the Copycat model and writes it to a Google Sheet.
+  """Generates new ads using the Copycat model and writes them to the Google Sheet.
+
+  This function orchestrates the ad generation process. It retrieves the ad
+  format,
+  generates or retrieves a style guide, prepares the data for generation,
+  generates new ads in batches using the Copycat model, and writes the generated
+  ads to the "Generated Ads" sheet in the Google Sheet.
 
   Args:
     config: A dictionary containing the configuration parameters.
-    sheets_client: gspread client object.
-    worksheet_url:  The URL of the Google Sheet containing the configuration.
-    config_sheet_name: The name of the sheet in the Google Sheet containing the
-      configuration.
+    config_sheet_name: The name of the sheet containing configuration
+      parameters.
+    sheet: The GoogleSheet object representing the spreadsheet.
+    copycat_instance: The instantiated Copycat model.
   """
-  style_guide = config["STYLE_GUIDE"] if "STYLE_GUIDE" in config else ""
-  training_data = None
-  test_data = None
+  max_headlines = google_ads.get_google_ad_format(
+      "responsive_search_ad"
+  ).max_headlines
+  max_descriptions = google_ads.get_google_ad_format(
+      "responsive_search_ad"
+  ).max_descriptions
+
+  style_guide = ""
+  if config["USE_STYLE_GUIDE"].lower() == "true":
+    style_guide = config["STYLE_GUIDE"] if "STYLE_GUIDE" in config else ""
 
   if not (style_guide and len(style_guide) > 1):
-    (config, training_data, test_data) = _style_guide_generation(
-        config,
-        sheets_client,
-        worksheet_url,
-        config_sheet_name,
+    style_guide = _style_guide_generation(
+        config, config_sheet_name, sheet, copycat_instance
     )
-    style_guide = config["STYLE_GUIDE"]
-  else:
-    (training_data, test_data) = _load_all_data(config, sheets_client)
 
-  # If new parameters are added to the copycat library, this create operations
-  # will need to be updated with those new parameters, as well as the config
-  # sheet of the spreadsheet.
-  model = copycat.Copycat.create_from_pandas(
-      training_data=training_data,
-      embedding_model_name=config["EMBEDDING_MODEL_NAME"],
-      ad_format=config["AD_FORMAT"],
+  generation_data, complete_data = _prepare_new_ads_for_generation(
+      sheet, n_versions=1, fill_gaps=True, copycat_instance=copycat_instance
   )
 
-  generated_ads = []
+  updated_complete_data = data_utils.explode_headlines_and_descriptions(
+      complete_data.copy().rename(
+          columns={
+              "existing_headlines": "headlines",
+              "existing_descriptions": "descriptions",
+          }
+      ),
+      max_headlines=max_headlines,
+      max_descriptions=max_descriptions,
+  )
+  _send_log("Loaded generation and complete data")
 
-  n_batches = np.ceil(len(test_data["keywords"]) / int(config["BATCH_SIZE"]))
+  if len(generation_data) == 0:
+    _send_log("No ads to generate")
+    return
 
-  for data_batch in np.array_split(test_data, n_batches, axis=0):
-    generated_ads.extend(
-        model.generate_new_ad_copy(
-            keywords=data_batch["keywords"].values.tolist(),
-            keywords_specific_instructions=data_batch[
-                "information"
-            ].values.tolist(),
-            system_instruction_kwargs=dict(
-                company_name=config["COMPANY_NAME"],
-                language=config["LANGUAGE"],
-            ),
-            style_guide=style_guide,
-            num_in_context_examples=int(config["NUM_IN_CONTEXT_EXAMPLES"]),
-            model_name=config["CHAT_MODEL_NAME"],
-            temperature=float(config["TEMPERATURE"]),
-            top_k=float(config["TOP_K"]),
-            top_p=float(config["TOP_P"]),
+  generation_params = dict(
+      system_instruction_kwargs=dict(
+          company_name=config["COMPANY_NAME"],
+          language=config["LANGUAGE"],
+      ),
+      num_in_context_examples=int(config["NUM_IN_CONTEXT_EXAMPLES"]),
+      model_name=config["CHAT_MODEL_NAME"],
+      temperature=float(config["TEMPERATURE"]),
+      top_k=float(config["TOP_K"]),
+      top_p=float(config["TOP_P"]),
+      allow_memorised_headlines=config["ALLOW_MEMORISED_HEADLINES"].lower()
+      == "yes",
+      allow_memorised_descriptions=config[
+          "ALLOW_MEMORISED_DESCRIPTIONS"
+      ].lower()
+      == "yes",
+      safety_settings=copycat.ALL_SAFETY_SETTINGS_ONLY_HIGH,
+      style_guide=style_guide,
+  )
+  limit = int(config["DATA_LIMIT"])
+  if limit == 0:
+    limit = None
+  data_iterator = data_utils.iterate_over_batches(
+      generation_data,
+      batch_size=int(config["BATCH_SIZE"]),
+      limit_rows=limit,
+  )
+  for batch_number, generation_batch in enumerate(data_iterator):
+    _send_log(f"Generating batch {batch_number+1}")
+    generation_batch["generated_ad_object"] = (
+        copycat_instance.generate_new_ad_copy_for_dataframe(
+            data=generation_batch,
+            keywords_specific_instructions_column="additional_instructions",
+            **generation_params,
+        )
+    )
+    generation_batch = (
+        generation_batch.pipe(data_utils.explode_generated_ad_object)
+        .pipe(
+            data_utils.explode_headlines_and_descriptions,
+            max_headlines=max_headlines,
+            max_descriptions=max_descriptions,
+        )
+        .drop(
+            columns=[
+                "generated_ad_object",
+                "existing_headlines",
+                "existing_descriptions",
+            ],
+            errors="ignore",
         )
     )
 
-    test_data["generated_ad_object"] = pd.Series(
-        generated_ads, index=data_batch["keywords"].index
+    isin_batch = updated_complete_data.index.isin(generation_batch.index)
+
+    updated_complete_data = updated_complete_data.loc[~isin_batch]
+    updated_complete_data = pd.concat([updated_complete_data, generation_batch])
+    updated_complete_data = updated_complete_data.fillna("").loc[
+        complete_data.index
+    ]
+
+    column_order = ["keywords", "additional_instructions"]
+    column_order.extend(
+        col
+        for col in updated_complete_data.columns
+        if col.startswith("Headline ")
+    )
+    column_order.extend(
+        col
+        for col in updated_complete_data.columns
+        if col.startswith("Description ")
+    )
+    column_order.extend(
+        col for col in updated_complete_data.columns if col not in column_order
     )
 
-  results = _extract_resulting_ads(test_data)
+    sheet["Generated Ads"] = updated_complete_data[column_order]
 
-  _write_results_into_google_sheet(config, sheets_client, results)
+  _send_log("Generation Complete")
 
 
 @functions_framework.http
@@ -217,11 +505,6 @@ def run(request: flask.Request) -> flask.Response:
       Response object using `make_response`
       <https://flask.palletsprojects.com/en/1.1.x/api/#flask.make_response>.
   """
-
-  logging_client = logging.Client()
-  log_name = os.environ["DEPLOYMENT_NAME"] + CF_NAME
-  logger = logging_client.logger(log_name)
-
   required_elem = [
       "PROJECT_ID",
       "REGION",
@@ -229,7 +512,7 @@ def run(request: flask.Request) -> flask.Response:
       "DEPLOYMENT_NAME",
   ]
   if not all(elem in os.environ for elem in required_elem):
-    logger.log_text(
+    _send_log(
         f"{FAILED_STATUS_FOR_REPORTING}: Cannot proceed, there are missing"
         " input values please make sure you set all the environment variables"
         " correctly."
@@ -237,9 +520,9 @@ def run(request: flask.Request) -> flask.Response:
 
     sys.exit(1)
 
-  logger.log(request)
+  _send_log(request)
   request_json = request.get_json(silent=True)
-  logger.log(request_json)
+  _send_log(request_json)
 
   try:
 
@@ -251,17 +534,26 @@ def run(request: flask.Request) -> flask.Response:
     print(f"Function name: {function_name}.")
     worksheet_url = request_json["worksheet_url"]
     config_sheet_name = request_json["config_sheet_name"]
-    sheets_client = _init_google_sheet_client()
+    _init_google_sheet_client()
+    sheet = sheets.GoogleSheet.load(worksheet_url)
+
     config = _read_config_from_google_sheet(
-        DEFAULT_CONFIG, sheets_client, worksheet_url, config_sheet_name
+        DEFAULT_CONFIG,
+        sheets.get_gspread_client(),
+        worksheet_url,
+        config_sheet_name,
     )
 
+    copycat_instance = _instantiate_copycat_model(config, sheet)
+
     call_function = globals()[function_name]
-    call_function(config, sheets_client, worksheet_url, config_sheet_name)
+    call_function(config, config_sheet_name, sheet, copycat_instance)
 
     return ("Results generated", 200)
   except Exception as e:
-    logger.log(str(e))
+
+    print(traceback.format_exc())
+    _send_log(str(e))
     logging_payload = {
         "worksheet_url": worksheet_url if worksheet_url else None,
         "config_sheet_name": config_sheet_name if config_sheet_name else None,
@@ -274,237 +566,51 @@ def run(request: flask.Request) -> flask.Response:
         "success": False,
     }
 
-    logger.log_text(
-        f"{FAILED_STATUS_FOR_REPORTING}: {json.dumps(logging_payload)}"
-    )
+    _send_log(f"{FAILED_STATUS_FOR_REPORTING}: {json.dumps(logging_payload)}")
 
     return (f"Error found: {str(e)}", 500)
 
 
-def _extract_descriptions(data: pd.Series) -> pd.Series:
-  """Extracts descriptions from a Pandas Series of Google Ad objects.
-
-  Args:
-    data: A Pandas Series where each element is assumed to have a 'google_ad'
-      attribute containing descriptions.
-
-  Returns:
-    A Pandas Series of descriptions, with the index formatted as 'Description
-    1',
-    'Description 2', etc.
-  """
-
-  return pd.Series(
-      data.google_ad.descriptions,
-      index=[
-          f"Description {i+1}" for i in range(len(data.google_ad.descriptions))
-      ],
-  )
-
-
-def _extract_headlines(data: pd.Series) -> pd.Series:
-  """Extracts headlines from a Pandas Series of Google Ad objects.
-
-  Args:
-    data: A Pandas Series where each element is assumed to have a 'google_ad'
-      attribute containing headlines.
-
-  Returns:
-    A Pandas Series of headlines, with the index formatted as 'Headline 1',
-    'Headline 2', etc.
-  """
-  return pd.Series(
-      data.google_ad.headlines,
-      index=[f"Headline {i+1}" for i in range(len(data.google_ad.headlines))],
-  )
-
-
-def _extract_resulting_ads(data: pd.Series) -> pd.Series:
-  """Extracts headlines and descriptions from generated ad objects.
-
-  This function takes a Pandas Series containing generated ad objects,
-  extracts the headlines and descriptions from those objects, and then
-  combines this information with the original keywords into a new DataFrame.
-
-  Args:
-    data: A Pandas Series where each element is a generated ad object.
-
-  Returns:
-    A Pandas Series containing the keywords, extracted headlines,
-    and extracted descriptions.
-  """
-  headlines = data["generated_ad_object"].apply(_extract_headlines).fillna("--")
-  descriptions = (
-      data["generated_ad_object"].apply(_extract_descriptions).fillna("--")
-  )
-
-  return (
-      data[["keywords"]]
-      .copy()
-      .merge(headlines, left_index=True, right_index=True)
-      .merge(descriptions, left_index=True, right_index=True)
-      .reset_index()
-  )
-
-
-def _load_data(
-    sheets_client: gspread.Client, config: dict[str, Any]
-) -> Union[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-  """Loads data from Google Sheets and prepares it for training.
-
-  Args:
-    sheets_client: gspread client object.
-    config: A dictionary containing the configuration parameters.
-
-  Returns:
-    A tuple containing three pandas DataFrames:
-      - clean_ad_report_data: Cleaned ad report data.
-      - keywords_data: Keywords data.
-      - new_keywords_data: New keywords data.
-  """
-
-  ad_report_data = _load_data_from_google_sheet(
-      config["AD_REPORT_URL"],
-      config["AD_REPORT_SHEET_NAME"],
-      sheets_client,
-      skip_rows=0,
-  )
-
-  search_keyword_report_data = _load_data_from_google_sheet(
-      config["SEARCH_KEYWORD_REPORT_URL"],
-      config["SEARCH_KEYWORD_REPORT_SHEET_NAME"],
-      sheets_client,
-      skip_rows=0,
-  )
-
-  new_keywords_data = _load_data_from_google_sheet(
-      config["NEW_KEYWORDS_URL"],
-      config["NEW_KEYWORDS_SHEET_NAME"],
-      sheets_client,
-      skip_rows=0,
-  )
-
-  clean_ad_report_data = _clean_ad_report_data(ad_report_data)
-
-  keywords_data = search_keyword_report_data[
-      ["Campaign ID", "Ad Group ID", "Keywords"]
-  ].copy()
-
-  keywords_data["Keyword"] = keywords_data["Keywords"].str.translate(
-      {ord(i): None for i in '+[]"'}
-  )
-
-  keywords_data = keywords_data.dropna().drop_duplicates()
-
-  keywords_data = keywords_data.groupby(["Campaign ID", "Ad Group ID"]).agg(
-      keywords=("Keyword", lambda x: ", ".join(x).lower())
-  )
-
-  keywords_data = keywords_data.loc[keywords_data["keywords"] != ""]
-
-  return (clean_ad_report_data, keywords_data, new_keywords_data)
-
-
-def _prepare_training_data(
-    ad_report_data: pd.DataFrame,
-    keywords_data: pd.DataFrame,
-    new_keywords_data: pd.DataFrame,
-) -> Union[pd.DataFrame, pd.DataFrame]:
-  """Prepares training and test data for the Copycat model.
-
-  This function merges and processes the input data to create two DataFrames:
-    - training_data: Contains keywords, headlines, and descriptions from
-      existing ad campaigns.
-    - test_data: Contains new keywords and any additional information
-      provided for generating new ad copy.
-
-  Args:
-    ad_report_data: DataFrame containing ad performance data, including
-      headlines and descriptions.
-    keywords_data: DataFrame containing keywords grouped by campaign and ad
-      group.
-    new_keywords_data: DataFrame containing new keywords and optional additional
-      information.
-
-  Returns:
-    A tuple containing two pandas DataFrames:
-      - training_data: Prepared data for training the Copycat model.
-      - test_data: Prepared data for generating new ad copy.
-  """
-  training_data = pd.merge(
-      keywords_data,
-      ad_report_data,
-      how="inner",
-      left_index=True,
-      right_index=True,
-  )
-
-  test_data = new_keywords_data.groupby(["Campaign", "Ad Group"]).agg(
-      keywords=("Keyword", lambda x: ", ".join(x).lower()),
-      information=("Extra info", lambda x: ", ".join(x).lower()),
-  )
-
-  return (training_data, test_data)
-
-
 def _generate_style_guide(
-    config: dict[str, Any], training_data: pd.DataFrame
+    config: dict[str, Any], copycat_instance: copycat.Copycat
 ) -> str:
-  """Generates a style guide for ad copy based on existing ad data.
+  """Generates a style guide using the Copycat model.
 
-  This function uses a large language model (defined in the 'config') to
-  analyze a DataFrame of existing ad copy ('training_data') and generate
-  a style guide that captures the brand's tone, key phrases, and messaging
-  patterns.
+  Leverages the Copycat instance's `generate_style_guide` method to create a
+  style
+  guide based on the provided configuration parameters.
 
   Args:
     config: A dictionary containing configuration parameters, including: -
-      'COMPANY_NAME': The name of the company. - 'USE_STYLE_GUIDE': A flag
-      indicating whether to generate a style guide. - 'CHAT_MODEL_NAME': The
-      name of the language model to use for generation. - 'TEMPERATURE': The
-      temperature parameter for the language model. - 'TOP_K': The top_k
-      parameter for the language model. - 'TOP_P': The top_p parameter for the
-      language model.
-    training_data: A DataFrame containing existing ad copy data, including
-      columns for keywords, headlines, and descriptions.
+      "COMPANY_NAME": The name of the company. -
+      "STYLE_GUIDE_ADDITIONAL_INSTRUCTIONS": Additional instructions for style
+      guide generation. - "CHAT_MODEL_NAME": The name of the language model to
+      use. - "TEMPERATURE": The temperature setting for the language model. -
+      "TOP_K": The top_k setting for the language model. - "TOP_P": The top_p
+      setting for the language model. - "STYLE_GUIDE_USE_EXEMPLAR_ADS": Whether
+      to use exemplar ads. - "STYLE_GUIDE_FILES_URL":  The URI of files to use
+      for the style guide.
+    copycat_instance: An instantiated Copycat model.
 
   Returns:
-    A string containing the generated style guide, or None if
-    'USE_STYLE_GUIDE' is False.
+    A string containing the generated style guide.
   """
 
-  if config["USE_STYLE_GUIDE"]:
-    style_guide_prompt = """
-    Below is an ad report for {company_name}, containing their ads (headlines
-    and descriptions)
-    that they use on Google Search Ads for the corresponding keywords.
-    Headlines and descriptions are lists, and Google constructs ads by combining
-    those headlines and descriptions together into ads. Therefore the headlines
-    and descriptions should be sufficiently varied that Google is able to try
-    lots of different combinations in order to find what works best.
+  style_guide = copycat_instance.generate_style_guide(
+      company_name=config["COMPANY_NAME"],
+      additional_style_instructions=config[
+          "STYLE_GUIDE_ADDITIONAL_INSTRUCTIONS"
+      ],
+      model_name=config["CHAT_MODEL_NAME"],
+      safety_settings=copycat.ALL_SAFETY_SETTINGS_ONLY_HIGH,
+      temperature=float(config["TEMPERATURE"]),
+      top_k=float(config["TOP_K"]),
+      top_p=float(config["TOP_P"]),
+      use_exemplar_ads=config["STYLE_GUIDE_USE_EXEMPLAR_ADS"],
+      files_uri=config["STYLE_GUIDE_FILES_URL"],
+  )
 
-    Use the ad report to write a comprehensive style guide for this brand's
-    ad copies that can serve as instruction for a copywriter to write new
-    ad copies for {company_name} for new lists of keywords.
-
-    Ensure that you capure strong phrases, slogans and brand names
-    of {company_name} in the guide.
-    \n\n{style_guide}
-    """.format(
-        company_name=config["COMPANY_NAME"],
-        style_guide=training_data.reset_index(drop=True).astype(str).to_csv(),
-    )
-
-    response = copycat.ad_copy_generator.generative_models.GenerativeModel(
-        config["CHAT_MODEL_NAME"],
-        generation_config={
-            "temperature": float(config["TEMPERATURE"]),
-            "top_k": float(config["TOP_K"]),
-            "top_p": float(config["TOP_P"]),
-        },
-    ).generate_content(style_guide_prompt)
-
-    return response.candidates[0].content.parts[0].text
+  return style_guide
 
 
 def _init_google_sheet_client():
@@ -512,9 +618,6 @@ def _init_google_sheet_client():
 
   This function sets up the necessary credentials and authorization
   to interact with Google Sheets using the gspread library.
-
-  Returns:
-    A gspread.Client object authorized to access Google Sheets.
   """
   scopes = [
       "https://www.googleapis.com/auth/spreadsheets",
@@ -523,9 +626,7 @@ def _init_google_sheet_client():
   ]
 
   credentials, _ = google.auth.default(scopes=scopes)
-  client = gspread.authorize(credentials)
-
-  return client
+  sheets.set_google_auth_credentials(credentials)
 
 
 def _read_config_from_google_sheet(
@@ -593,115 +694,24 @@ def _load_data_from_google_sheet(
     raise (e)
 
 
-def _clean_ad_report_data(ad_report_data: pd.DataFrame) -> pd.DataFrame:
-  """Cleans and structures ad report data from a DataFrame.
-
-  This function processes a DataFrame containing raw ad report data,
-  extracting and structuring headlines and descriptions into lists
-  associated with each campaign and ad group.
-
-  Args:
-    ad_report_data: A DataFrame containing raw ad report data, likely with
-      columns for headlines, descriptions, and campaign/ad group IDs.
-
-  Returns:
-    A cleaned DataFrame with headlines and descriptions grouped as lists
-    for each unique combination of "Campaign ID" and "Ad Group ID".
-  """
-
-  clean_ad_report_data = ad_report_data.copy()
-
-  headline_cols = [
-      c
-      for c in clean_ad_report_data.columns
-      if c.startswith("Headline") and not c.endswith("position")
-  ]
-  description_cols = [
-      c
-      for c in clean_ad_report_data.columns
-      if c.startswith("Description") and not c.endswith("position")
-  ]
-  clean_ad_report_data["headlines"] = pd.Series(
-      {
-          k: list(
-              filter(lambda x: x != "--" and x and not x.startswith("{"), v),
-          )
-          for k, v in clean_ad_report_data[headline_cols]
-          .T.to_dict("list")
-          .items()
-      },
-      index=clean_ad_report_data.index,
-  )
-  clean_ad_report_data["descriptions"] = pd.Series(
-      {
-          k: list(filter(lambda x: x != "--" and x, v))
-          for k, v in clean_ad_report_data[description_cols]
-          .T.to_dict("list")
-          .items()
-      },
-      index=clean_ad_report_data.index,
-  )
-  clean_ad_report_data = clean_ad_report_data.set_index(
-      ["Campaign ID", "Ad Group ID"]
-  )[["headlines", "descriptions"]]
-  clean_ad_report_data = clean_ad_report_data.loc[
-      clean_ad_report_data["headlines"].apply(len) > 0
-  ]
-
-  return clean_ad_report_data
-
-
-def _write_results_into_google_sheet(
-    config: dict[str, str], sheets_client: gspread.Client, results: pd.Series
-):
-  """Writes the generated ad copy results to a Google Sheet.
-
-  Args:
-    config: A dictionary containing configuration parameters, including: -
-      'RESULTS_URL': The URL of the Google Sheet to write to. -
-      'RESULTS_SHEET_NAME': The name of the sheet within the Google Sheet where
-      results should be written.
-    sheets_client: A gspread.Client object for interacting with Google Sheets.
-    results: A pandas Series containing the generated ad copy results.
-  """
-  results_sheet_name = config["RESULTS_SHEET_NAME"]
-
-  sheet = sheets_client.open_by_url(config["RESULTS_URL"])
-
-  column_letters = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
-
-  values = results.values.tolist()
-  values.insert(0, results.columns.values.tolist())
-
-  worksheets = [ws.title for ws in sheet.worksheets()]
-
-  if results_sheet_name not in worksheets:
-    sheet.add_worksheet(results_sheet_name, len(values), 100)
-
-  sheet.worksheet(results_sheet_name).update(
-      f"A1:{column_letters[len(values[0])-1]}{len(values)+1}", values
-  )
-
-
 def _write_config_into_google_sheet(
     config: dict[str, str],
-    sheets_client: gspread.Client,
-    worksheet_url: str,
-    config_sheet_name: str,
+    sheet: sheets.GoogleSheet,
+    config_sheet_name: str
 ):
   """Writes the configuration parameters to a Google Sheet.
 
   Args:
     config: A dictionary containing the configuration parameters.
-    sheets_client: gspread client object.
-    worksheet_url: The URL of the Google Sheet containing the configuration.
+    sheet: GoogleSheet object.
     config_sheet_name: The name of the sheet in the Google Sheet containing the
       configuration.
   """
-  sheet = sheets_client.open_by_url(worksheet_url)
-  config_sheet = sheet.worksheet(config_sheet_name)
+  worksheet_url = sheet.url
+  client = sheets.get_gspread_client()
+  worksheet = client.open_by_url(worksheet_url)
+  config_sheet = worksheet.worksheet(config_sheet_name)
 
   cell = config_sheet.find("STYLE_GUIDE")
   if cell:
     config_sheet.update_cell(cell.row, cell.col + 1, config["STYLE_GUIDE"])
-

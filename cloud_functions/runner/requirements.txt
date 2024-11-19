@@ -12,19 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-pydantic
-pyarrow
-scikit-learn
-pandas
-gspread
-google-cloud-aiplatform
-google-cloud-logging
+pydantic == 2.8.2
+pyarrow == 17.0.0
+pandas == 2.2.2
+gspread == 6.1.2
+google-cloud-aiplatform == 1.60.0
+google-cloud-logging == 3.11.0
 functions-framework >= 3.0.0
-langchain-google-vertexai
-langchain
-langchain-community
-langchain-core
-nest-asyncio
-pandas
-beautifulsoup4
-tqdm
+nest-asyncio == 1.6.0
+tqdm == 4.66.5
+gtech-copycat[google_sheets] == 0.0.1
