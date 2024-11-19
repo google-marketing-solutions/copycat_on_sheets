@@ -56,15 +56,3 @@ variable "USER_LIST" {
   description = "The list of users email to grant access to copycat separated by comma"
   default = ""
 }
-
-variable "COPYCAT_CLONE_REPOSITORY_COMMAND" {
-  type = string
-  description = "The list of users to grant access to copycat"
-  default = "git clone https://github.com/google-marketing-solutions/copycat.git"
-}
-
-variable "COPYCAT_CLEAN_REPOSITORY_DIR_COMMAND" {
-  type = string
-  description = "The list of users to grant access to copycat"
-  default = "rm -rf"
-}
