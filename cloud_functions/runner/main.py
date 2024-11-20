@@ -25,7 +25,7 @@ from typing import Any
 import flask
 import functions_framework
 import google.auth
-from google.cloud import logging
+from google.cloud import logging as gclogging
 import gspread
 import nest_asyncio
 import pandas as pd
@@ -53,8 +53,7 @@ DEFAULT_CONFIG = {
     "TOP_K": 50,
     "TOP_P": 1,
     "BATCH_SIZE": 10,
-    "DATA_LIMIT": 0,
-    "GENERATION_LIMIT": 30,
+    "GENERATION_LIMIT": 0,
     "USE_CUSTOM_AFFINITY_PREFERENCE": "TRUE",
     "CUSTOM_AFFINITY_PREFERENCE": -0.5,
     "EXEMPLAR_SELECTION_METHOD": "affinity_propagation",
@@ -80,7 +79,7 @@ OPERATIONS = {
 
 def _init_log():
   """Initializes the logger."""
-  client = google.cloud.logging.Client()
+  client = gclogging.Client()
   client.setup_logging()
   return logging.getLogger("copycat.on_sheets")
 
@@ -329,8 +328,8 @@ def _instantiate_copycat_model(config: pd.DataFrame, sheet: sheets.GoogleSheet):
     ad_format = copycat.google_ads.get_google_ad_format(config["AD_FORMAT"])
 
   affinity_preference = (
-      config["CUSTOM_AFFINITY_PREFERENCE"]
-      if config["CUSTOM_AFFINITY_PREFERENCE"]
+      float(config["CUSTOM_AFFINITY_PREFERENCE"])
+      if config["USE_CUSTOM_AFFINITY_PREFERENCE"].lower() == "true"
       else None
   )
 
@@ -430,7 +429,7 @@ def _ads_generation(
       safety_settings=copycat.ALL_SAFETY_SETTINGS_ONLY_HIGH,
       style_guide=style_guide,
   )
-  limit = int(config["DATA_LIMIT"])
+  limit = int(config["GENERATION_LIMIT"])
   if limit == 0:
     limit = None
   data_iterator = data_utils.iterate_over_batches(
@@ -568,7 +567,7 @@ def run(request: flask.Request) -> flask.Response:
 
     _send_log(f"{FAILED_STATUS_FOR_REPORTING}: {json.dumps(logging_payload)}")
 
-    return (f"Error found: {str(e)}", 500)
+    return (json.dumps(logging_payload), 500)
 
 
 def _generate_style_guide(
