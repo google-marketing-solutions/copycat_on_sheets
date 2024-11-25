@@ -54,6 +54,7 @@ DEFAULT_CONFIG = {
     "TOP_P": 1,
     "BATCH_SIZE": 10,
     "GENERATION_LIMIT": 0,
+    "NUM_AD_VERSIONS": 1,
     "USE_CUSTOM_AFFINITY_PREFERENCE": "TRUE",
     "CUSTOM_AFFINITY_PREFERENCE": -0.5,
     "EXEMPLAR_SELECTION_METHOD": "affinity_propagation",
@@ -391,7 +392,10 @@ def _ads_generation(
     )
 
   generation_data, complete_data = _prepare_new_ads_for_generation(
-      sheet, n_versions=1, fill_gaps=True, copycat_instance=copycat_instance
+      sheet,
+      int(config["NUM_AD_VERSIONS"]),
+      fill_gaps=True,
+      copycat_instance=copycat_instance
   )
 
   updated_complete_data = data_utils.explode_headlines_and_descriptions(
