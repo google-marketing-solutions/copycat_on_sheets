@@ -340,7 +340,7 @@ def _instantiate_copycat_model(config: pd.DataFrame, sheet: sheets.GoogleSheet):
       on_invalid_ad=config["ON_INVALID_AD"],
       embedding_model_name=config["EMBEDDING_MODEL_NAME"],
       embedding_model_dimensionality=float(config["MODEL_DIMENSIONALITY"]),
-      embedding_model_batch_size=int(config["BATCH_SIZE"]),
+      embedding_model_batch_size=min(10, int(config["BATCH_SIZE"])),
       vectorstore_exemplar_selection_method=config["EXEMPLAR_SELECTION_METHOD"],
       vectorstore_max_initial_ads=int(config["MAX_INITIAL_ADS"]),
       vectorstore_max_exemplar_ads=int(config["MAX_EXEMPLAR_ADS"]),

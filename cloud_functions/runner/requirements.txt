@@ -21,4 +21,4 @@ google-cloud-logging == 3.11.0
 functions-framework >= 3.0.0
 nest-asyncio == 1.6.0
 tqdm == 4.66.5
-gtech-copycat[google_sheets] == 0.0.1
+gtech-copycat[google_sheets] == 0.0.4
