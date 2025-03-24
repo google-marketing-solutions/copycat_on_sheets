@@ -130,8 +130,7 @@ def _prepare_training_data(
         prepared_training_ads["descriptions"].apply(len) > 0
     ]
 
-  if not prepared_training_ads["headlines"].apply(len).all():
-    return prepared_training_ads
+  return prepared_training_ads
 
 
 def _prepare_new_ads_for_generation(
@@ -251,10 +250,7 @@ def _prepare_new_ads_for_generation(
 
 
 def _style_guide_generation(
-    config: dict[str, str],
-    config_sheet_name: str,
-    sheet: sheets.GoogleSheet,
-    copycat_instance: copycat.Copycat,
+    config: dict[str, str], config_sheet_name: str, sheet: sheets.GoogleSheet
 ) -> str:
   """Generates a style guide and writes it to the config sheet.
 
@@ -267,11 +263,13 @@ def _style_guide_generation(
     config_sheet_name: The name of the sheet in the Google Sheet containing the
       configuration.
     sheet: A GoogleSheet object representing the spreadsheet.
-    copycat_instance: A Copycat object used for generating the style guide.
 
   Returns:
     The generated style guide string.
   """
+  copycat_instance = _instantiate_copycat_model_for_style_guide_generation(
+      config, sheet
+  )
   config["STYLE_GUIDE"] = _generate_style_guide(config, copycat_instance)
   _write_config_into_google_sheet(config, sheet, config_sheet_name)
   return config["STYLE_GUIDE"]
@@ -292,6 +290,7 @@ def _instantiate_copycat_model(config: pd.DataFrame, sheet: sheets.GoogleSheet):
     A Copycat instance.
   """
   training_ads_data = _prepare_training_data(config, sheet)
+
   if config["AD_FORMAT"] == "generic_ad":
     ad_format = copycat.google_ads.GoogleAdFormat(
         name="generic_ad",
@@ -338,11 +337,53 @@ def _instantiate_copycat_model(config: pd.DataFrame, sheet: sheets.GoogleSheet):
   return copycat_instance
 
 
+def _instantiate_copycat_model_for_style_guide_generation(
+    config: pd.DataFrame, sheet: sheets.GoogleSheet
+):
+  """Instantiates a Copycat model.
+
+  Prepares the training data, determines the ad format, and creates a Copycat
+  instance using the provided configuration and data from the Google Sheet. This
+  version is used for style guide generation.
+
+
+  Args:
+    config: A Pandas DataFrame containing the configuration parameters.
+    sheet: A GoogleSheet object representing the spreadsheet containing the
+      data.
+
+  Returns:
+    A Copycat instance.
+  """
+  training_ads_data = _prepare_training_data(config, sheet)
+
+  ad_format = copycat.google_ads.get_google_ad_format("responsive_search_ad")
+  affinity_preference = (
+      float(config["CUSTOM_AFFINITY_PREFERENCE"])
+      if config["USE_CUSTOM_AFFINITY_PREFERENCE"].lower() == "true"
+      else None
+  )
+  copycat_instance = copycat.Copycat.create_from_pandas(
+      training_data=training_ads_data,
+      ad_format=ad_format,
+      on_invalid_ad=config["ON_INVALID_AD"],
+      embedding_model_name=config["EMBEDDING_MODEL_NAME"],
+      embedding_model_dimensionality=float(config["MODEL_DIMENSIONALITY"]),
+      embedding_model_batch_size=min(10, int(config["BATCH_SIZE"])),
+      vectorstore_exemplar_selection_method=config["EXEMPLAR_SELECTION_METHOD"],
+      vectorstore_max_initial_ads=int(config["MAX_INITIAL_ADS"]),
+      vectorstore_max_exemplar_ads=int(config["MAX_EXEMPLAR_ADS"]),
+      vectorstore_affinity_preference=affinity_preference,
+      replace_special_variables_with_default=config[
+          "REPLACE_SPECIAL_VARIABLES_WITH_DEFAULT"
+      ]
+      == "replace",
+  )
+  return copycat_instance
+
+
 def _ads_generation(
-    config: dict[str, str],
-    config_sheet_name: str,
-    sheet: sheets.GoogleSheet,
-    copycat_instance: copycat.Copycat,
+    config: dict[str, str], config_sheet_name: str, sheet: sheets.GoogleSheet
 ):
   """Generates new ads using the Copycat model and writes them to the Google Sheet.
 
@@ -356,7 +397,6 @@ def _ads_generation(
     config_sheet_name: The name of the sheet containing configuration
       parameters.
     sheet: The GoogleSheet object representing the spreadsheet.
-    copycat_instance: The instantiated Copycat model.
   """
   max_headlines = google_ads.get_google_ad_format(
       "responsive_search_ad"
@@ -368,9 +408,13 @@ def _ads_generation(
   if config["USE_STYLE_GUIDE"].lower() == "true":
     style_guide = config["STYLE_GUIDE"] if "STYLE_GUIDE" in config else ""
   if not (style_guide and len(style_guide) > 1):
+    copycat_instance = _instantiate_copycat_model_for_style_guide_generation(
+        config, sheet
+    )
     style_guide = _style_guide_generation(
         config, config_sheet_name, sheet, copycat_instance
     )
+  copycat_instance = _instantiate_copycat_model(config, sheet)
   if "Extra Instructions for New Ads" in sheet:
     num_versions = (
         sheet["Extra Instructions for New Ads"]
@@ -570,9 +614,8 @@ def run(request: flask.Request) -> flask.Response:
         worksheet_url,
         config_sheet_name,
     )
-    copycat_instance = _instantiate_copycat_model(config, sheet)
     call_function = globals()[function_name]
-    call_function(config, config_sheet_name, sheet, copycat_instance)
+    call_function(config, config_sheet_name, sheet)
     return ("Results generated", 200)
   except Exception as e:
     print(traceback.format_exc())
