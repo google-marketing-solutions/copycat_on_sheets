@@ -412,7 +412,7 @@ def _ads_generation(
         config, sheet
     )
     style_guide = _style_guide_generation(
-        config, config_sheet_name, sheet, copycat_instance
+        config, config_sheet_name, sheet
     )
   copycat_instance = _instantiate_copycat_model(config, sheet)
   if "Extra Instructions for New Ads" in sheet:
