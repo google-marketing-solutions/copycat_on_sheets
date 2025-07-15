@@ -28,6 +28,7 @@ from google.cloud import logging as gclogging
 import gspread
 import nest_asyncio
 import pandas as pd
+import vertexai
 
 nest_asyncio.apply()
 from copycat import copycat
@@ -44,7 +45,7 @@ DEFAULT_CONFIG = {
     "EMBEDDING_MODEL_NAME": "text-embedding-004",
     "AD_FORMAT": "responsive_search_ad",
     "LANGUAGE": "English",
-    "CHAT_MODEL_NAME": "gemini-1.5-pro",
+    "CHAT_MODEL_NAME": "gemini-2.0-pro",
     "MODEL_DIMENSIONALITY": 768,
     "TEMPERATURE": 0.7,
     "TOP_K": 50,
@@ -412,7 +413,7 @@ def _ads_generation(
         config, sheet
     )
     style_guide = _style_guide_generation(
-        config, config_sheet_name, sheet, copycat_instance
+        config, config_sheet_name, sheet
     )
   copycat_instance = _instantiate_copycat_model(config, sheet)
   if "Extra Instructions for New Ads" in sheet:
@@ -598,6 +599,8 @@ def run(request: flask.Request) -> flask.Response:
   request_json = request.get_json(silent=True)
   _send_log(request_json)
   try:
+    vertexai.init(
+        project=os.environ["PROJECT_ID"], location=os.environ["REGION"])
     operation = request_json["operation"]
     print(f"Operation: {operation}.")
     function_name = (

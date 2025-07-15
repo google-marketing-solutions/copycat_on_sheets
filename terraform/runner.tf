@@ -28,7 +28,7 @@ resource "google_cloud_run_v2_service_iam_binding" "runner_cf_cr_binding" {
   project  = google_cloudfunctions2_function.runner.project
   name     = google_cloudfunctions2_function.runner.name
   role     = "roles/run.invoker"
-  members        = ["allUsers"]
+  members        = formatlist("%s%s", "user:", split(",", var.USER_LIST))
 }
 
 resource "google_cloud_run_v2_service_iam_binding" "runner_cf_srva_binding" {
