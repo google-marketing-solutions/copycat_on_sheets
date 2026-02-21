@@ -16,7 +16,7 @@ pydantic == 2.8.2
 pyarrow == 17.0.0
 pandas == 2.2.2
 gspread == 6.1.2
-google-cloud-aiplatform == 1.60.0
+google-cloud-aiplatform == 1.133.0
 google-cloud-logging == 3.11.0
 functions-framework >= 3.0.0
 nest-asyncio == 1.6.0
