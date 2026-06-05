@@ -13,7 +13,7 @@
 # limitations under the License.
 
 pydantic == 2.8.2
-pyarrow == 17.0.0
+pyarrow == 23.0.1
 pandas == 2.2.2
 gspread == 6.1.2
 google-cloud-aiplatform == 1.60.0
